@@ -6,10 +6,9 @@ from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
 
-from langgraph.types import Command
-
 from langgraph.constants import Send
 from langgraph.graph import START, END, StateGraph
+from langgraph.types import interrupt, Command
 
 from src.open_deep_research.state import ReportStateInput, ReportStateOutput, Sections, ReportState, SectionState, SectionOutputState, Queries, Feedback
 from src.open_deep_research.prompts import report_planner_query_writer_instructions, report_planner_instructions, query_writer_instructions, section_writer_instructions, final_section_writer_instructions, section_grader_instructions
@@ -20,7 +19,7 @@ from src.open_deep_research.utils import tavily_search_async, deduplicate_and_fo
 writer_model = ChatAnthropic(model=Configuration.writer_model, temperature=0) 
 
 # Nodes
-async def generate_report_plan(state: ReportState, config: RunnableConfig):
+async def generate_report_plan(state: ReportState, config: RunnableConfig) -> Command[Literal["generate_report_plan","build_section_with_web_research"]]:
     """ Generate the report plan """
 
     # Inputs
@@ -87,12 +86,42 @@ async def generate_report_plan(state: ReportState, config: RunnableConfig):
     structured_llm = planner_llm.with_structured_output(Sections)
     report_sections = structured_llm.invoke([SystemMessage(content=system_instructions_sections)]+[HumanMessage(content="Generate the sections of the report. Your response must include a 'sections' field containing a list of sections. Each section must have: name, description, plan, research, and content fields.")])
 
-    return {"sections": report_sections.sections}
+    # Get sections
+    sections = report_sections.sections
 
-def human_feedback(state: ReportState):
-    """ No-op node that should be interrupted on """
-    pass
+    """ Get feedback on the report plan """
+    sections_str = "\n\n".join(
+        f"Section: {section.name}\n"
+        f"Description: {section.description}\n"
+        f"Research needed: {'Yes' if section.research else 'No'}\n"
+        for section in sections
+    )
 
+    # Get feedback on the report plan from interrupt
+    feedback = interrupt(f"Please provide feedback on the following report plan. \n\n{sections_str}\n\n Pass 'True' to approve the report plan or provide feedback to regenerate the report plan:")
+
+    print(f"Feedback: {feedback}")
+    print(f"Feedback type: {type(feedback)}")
+
+    # If the user approves the report plan, kick off section writing
+    # if isinstance(feedback, bool) and feedback is True:
+    if isinstance(feedback, bool):
+        # Treat this as approve and kick off section writing
+        return Command(goto=[
+            Send("build_section_with_web_research", {"section": s, "search_iterations": 0}) 
+            for s in sections 
+            if s.research
+        ],
+        update={"sections": sections})
+    
+    # If the user provides feedback, regenerate the report plan 
+    elif isinstance(feedback, str):
+        # treat this as feedback
+        return Command(goto="generate_report_plan", 
+                       update={"feedback_on_report_plan": feedback})
+    else:
+        raise TypeError(f"Interrupt value of type {type(feedback)} is not supported.")
+    
 def generate_queries(state: SectionState, config: RunnableConfig):
     """ Generate search queries for a report section """
 
@@ -185,27 +214,6 @@ def write_section(state: SectionState, config: RunnableConfig) -> Command[Litera
         goto="search_web"
         )
     
-def initiate_section_writing(state: ReportState):
-    """ This is the "map" step when we kick off web research for some sections of the report """    
-        
-    # Get feedback
-    feedback = state.get("feedback_on_report_plan", None)
-
-    # Feedback is by default None and accept_report_plan is by default False
-    # If a user hits "Continue" in Studio, we want to proceed with the report plan
-    # If a user enters feedback_on_report_plan in Studio, we want to regenerate the report plan
-    # Once a user enters feedback_on_report_plan, they need to flip accept_report_plan to True to proceed
-    if not state.get("accept_report_plan") and feedback:
-        return "generate_report_plan"
-    
-    # Kick off section writing in parallel via Send() API for any sections that require research
-    else: 
-        return [
-            Send("build_section_with_web_research", {"section": s, "search_iterations": 0}) 
-            for s in state["sections"] 
-            if s.research
-        ]
-
 def write_final_sections(state: SectionState):
     """ Write final sections of the report, which do not require web search and use the completed sections as context """
 
@@ -280,7 +288,6 @@ section_builder.add_edge("search_web", "write_section")
 # Add nodes
 builder = StateGraph(ReportState, input=ReportStateInput, output=ReportStateOutput, config_schema=Configuration)
 builder.add_node("generate_report_plan", generate_report_plan)
-builder.add_node("human_feedback", human_feedback)
 builder.add_node("build_section_with_web_research", section_builder.compile())
 builder.add_node("gather_completed_sections", gather_completed_sections)
 builder.add_node("write_final_sections", write_final_sections)
@@ -288,11 +295,9 @@ builder.add_node("compile_final_report", compile_final_report)
 
 # Add edges
 builder.add_edge(START, "generate_report_plan")
-builder.add_edge("generate_report_plan", "human_feedback")
-builder.add_conditional_edges("human_feedback", initiate_section_writing, ["build_section_with_web_research", "generate_report_plan"])
 builder.add_edge("build_section_with_web_research", "gather_completed_sections")
 builder.add_conditional_edges("gather_completed_sections", initiate_final_section_writing, ["write_final_sections"])
 builder.add_edge("write_final_sections", "compile_final_report")
 builder.add_edge("compile_final_report", END)
 
-graph = builder.compile(interrupt_before=['human_feedback'])
+graph = builder.compile()
